@@ -31,9 +31,6 @@ class Player:
     name: str
     surname: str
     position: str  # "врт" | "защ" | "фрв"
-    matches: int
-    win_percent: float
-    mvp_count: int
     rating: int  # 60–99
     card_name: str  # optional override, e.g. "gold", "silver", "bronze"
     photo_filename: str
@@ -59,29 +56,11 @@ def read_lineups_from_csv(path: str = LINEUPS_CSV_PATH) -> Tuple[List[Player], L
             except (ValueError, AttributeError):
                 rating = 60
 
-            try:
-                matches = int(row.get("matches", "").strip() or 0)
-            except (ValueError, AttributeError):
-                matches = 0
-
-            try:
-                win_percent = float(row.get("win_percent", "").strip() or 0.0)
-            except (ValueError, AttributeError):
-                win_percent = 0.0
-
-            try:
-                mvp_count = int(row.get("mvp_count", "").strip() or 0)
-            except (ValueError, AttributeError):
-                mvp_count = 0
-
             player = Player(
                 team=team_num,
                 name=(row.get("name") or "").strip(),
                 surname=(row.get("surname") or "").strip(),
                 position=(row.get("position") or "").strip().lower(),
-                matches=matches,
-                win_percent=win_percent,
-                mvp_count=mvp_count,
                 rating=rating,
                 card_name=(row.get("card_name") or "").strip().lower(),
                 photo_filename=(row.get("photo_filename") or "").strip(),

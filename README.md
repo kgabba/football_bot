@@ -39,22 +39,19 @@ football_mini_app/
 Файл в кодировке UTF‑8 с заголовком, пример:
 
 ```csv
-team,name,surname,position,matches,win_percent,mvp_count,rating,card_name,photo_filename
-1,Иван,Иванов,врт,25,60,3,86,,ivan_ivanov.png
-1,Пётр,Петров,защ,40,55,1,78,,petr_petrov.png
-1,Сергей,Сидоров,фрв,30,70,5,90,,sergey_sidorov.png
-2,Антон,Антонов,врт,20,50,2,82,,anton_antonov.png
-2,Максим,Максимов,защ,35,65,4,88,,maksim_maksimov.png
-2,Денис,Денисов,фрв,28,62,2,79,,denis_denisov.png
+team,name,surname,position,rating,card_name,photo_filename
+1,Иван,Иванов,врт,86,,ivan_ivanov.png
+1,Пётр,Петров,защ,78,,petr_petrov.png
+1,Сергей,Сидоров,фрв,90,,sergey_sidorov.png
+2,Антон,Антонов,врт,82,,anton_antonov.png
+2,Максим,Максимов,защ,88,,maksim_maksimov.png
+2,Денис,Денисов,фрв,79,,denis_denisov.png
 ```
 
 - **team**: номер команды (`1` или `2`).
 - **name**: имя (будет показано на карточке).
 - **surname**: фамилия (можешь использовать только для себя).
 - **position**: `врт`, `защ` или `фрв`.
-- **matches**: количество сыгранных матчей.
-- **win_percent**: процент побед (0–100).
-- **mvp_count**: сколько раз игрок был MVP.
 - **rating**: общий рейтинг (60–99), **используется** для выбора типа карточки и текста рейтинга.
 - **card_name**: необязательно, можно оставить пустым — фон выбирается автоматически:
   - `< 80` → `bronze.png`
