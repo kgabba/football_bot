@@ -139,3 +139,47 @@ uvicorn app.main:app --reload
 
 Эти URL можно будет использовать в Telegram mini app (или просто открыть в браузере) как готовые изображения составов.
 
+---
+
+## Telegram-бот (MVP)
+
+Отдельный микросервис: в боте выбираешь, кто в игре (множественный выбор кнопками), затем по очереди назначаешь каждого в красную или синюю команду; итоговый состав уходит в core, оттуда приходят два фото составов.
+
+### Как устроено
+
+1. **Core** — по-прежнему генерирует картинки. Добавлена ручка **`POST /api/lineups/generate`**: в теле запроса CSV в формате `team,name,surname,position,rating,card_name,photo_filename`; в ответе — JSON с URL двух изображений.
+2. **Бот** (`bot/`) — хранит базу игроков в `bot/data/players.csv` (поля: name, surname, position, rating, card_name, photo_filename, mvp, games, goals, wins). По команде `/start` показывает список игроков **кнопками с множественным выбором**: нажимаешь — ставится галочка «в игре», ещё раз — снимается. Кнопка «Готово» переводит к шагу «Распределение»: по одному игроку и две кнопки «Красная (1)» / «Синяя (2)». После распределения всех бот отправляет CSV в core и присылает в чат два фото составов.
+
+### Запуск через Docker Compose
+
+Два сервиса: **core** (FastAPI) и **bot** (Telegram).
+
+1. Создай бота через [@BotFather](https://t.me/BotFather), скопируй токен.
+2. В корне проекта создай папки и ассеты, если ещё нет: `data/`, `assets/field.png`, `assets/cards/`, `assets/players/` (фото по именам из `bot/data/players.csv`).
+3. Запуск:
+
+```bash
+export BOT_TOKEN=твой_токен
+docker compose up --build
+```
+
+- Core: `http://localhost:8000`
+- Бот подключается к core по имени сервиса `http://core:8000` (переменная `CORE_URL` в `docker-compose.yml`).
+
+4. В Telegram отправь боту `/start` и отметь игроков кнопками, затем «Готово» и распредели по командам.
+
+### Локальный запуск бота (без Docker)
+
+```bash
+# Терминал 1 — core
+uvicorn app.main:app --reload
+
+# Терминал 2 — бот (из корня проекта, чтобы пакет bot был в PYTHONPATH)
+pip install -r bot/requirements.txt
+export BOT_TOKEN=...
+export CORE_URL=http://localhost:8000
+python -m bot.main
+```
+
+Список игроков для выбора и распределения лежит в `bot/data/players.csv`; имена файлов фото должны совпадать с теми, что лежат в `assets/players/` у core.
+

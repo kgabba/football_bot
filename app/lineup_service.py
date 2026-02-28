@@ -430,14 +430,15 @@ def generate_team_lineup_image(players: List[Player], team_number: int) -> str:
     return output_path
 
 
-def generate_both_lineups() -> Tuple[str, str]:
+def generate_both_lineups(csv_path: str | None = None) -> Tuple[str, str]:
     """
     Main high-level function:
-    - read CSV
+    - read CSV from path or default LINEUPS_CSV_PATH
     - generate team1 and team2 images
     - return their file system paths
     """
-    team1, team2 = read_lineups_from_csv()
+    path = csv_path or LINEUPS_CSV_PATH
+    team1, team2 = read_lineups_from_csv(path)
 
     if not team1 or not team2:
         raise ValueError("Lineups not fully defined (need both teams with players).")

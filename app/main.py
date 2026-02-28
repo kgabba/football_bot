@@ -1,6 +1,7 @@
 import os
+import tempfile
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -71,6 +72,71 @@ async def get_lineups():
         )
 
     # Преобразуем абсолютные пути в URL под /static
+    def to_url(path: str) -> str:
+        rel = os.path.relpath(path, STATIC_DIR).replace(os.sep, "/")
+        return f"/static/{rel}"
+
+    return {
+        "status": "ok",
+        "teams": [
+            {"team": 1, "image_url": to_url(img1_path)},
+            {"team": 2, "image_url": to_url(img2_path)},
+        ],
+    }
+
+
+@app.post("/api/lineups/generate")
+async def generate_lineups_from_csv(request: Request):
+    """
+    Принимает CSV в теле запроса (content-type: text/csv или text/plain).
+    Формат: team,name,surname,position,rating,card_name,photo_filename
+    Генерирует два состава и возвращает URL картинок.
+    """
+    csv_body = (await request.body()).decode("utf-8")
+    if not csv_body or not csv_body.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "CSV body is required"},
+        )
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(csv_body.strip())
+            tmp_path = f.name
+        try:
+            img1_path, img2_path = generate_both_lineups(csv_path=tmp_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except FileNotFoundError as e:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "assets_missing",
+                "message": str(e),
+            },
+        )
+    except ValueError as e:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "no_lineups",
+                "message": "Составы не сформированы",
+                "details": str(e),
+            },
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e),
+            },
+        )
+
     def to_url(path: str) -> str:
         rel = os.path.relpath(path, STATIC_DIR).replace(os.sep, "/")
         return f"/static/{rel}"

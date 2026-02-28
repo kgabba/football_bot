@@ -1,0 +1,21 @@
+services:
+  core:
+    build:
+      context: .
+      dockerfile: Dockerfile.core
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./assets:/app/assets
+      - ./static:/app/static
+
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - CORE_URL=http://core:8000
+    depends_on:
+      - core
