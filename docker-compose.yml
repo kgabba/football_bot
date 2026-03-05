@@ -14,8 +14,12 @@ services:
     build:
       context: ./bot
       dockerfile: Dockerfile
+    env_file: .env
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
-      - CORE_URL=http://core:8000
+      - GROUP_CHAT_ID=${GROUP_CHAT_ID}
+      - CORE_URL=${CORE_URL:-http://core:8000}
+      - PLAYERS_SHEET_CSV_URL=${PLAYERS_SHEET_CSV_URL}
+      - ADMIN_USERNAMES=${ADMIN_USERNAMES}
     depends_on:
       - core

@@ -1,15 +1,34 @@
-"""Telegram bot handlers: multi-select players, then distribute by teams, call core, send photos."""
+"""Бот: стартовое меню (админ-панель / капитанская дуэль), голосование, драфт, отправка составов в группу."""
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from .players import load_players, build_lineup_csv, PlayerRecord
+from .config import GROUP_CHAT_ID_INT, is_admin
+from .players import load_players, build_lineup_csv, get_match_player_indices as players_match_indices, PlayerRecord
 from .state import get_state, clear_state
+from .match_state import (
+    is_voting_active,
+    get_voted_user_ids,
+    get_match_player_indices,
+    get_match_user_ids,
+    has_match_players,
+    start_voting,
+    add_vote,
+    finish_voting,
+    set_active_poll_id,
+    get_active_poll_id,
+    get_captain_queue,
+    add_captain_candidate,
+    set_draft,
+    draft_get_state,
+    draft_pick,
+    draft_set_group_message_id,
+    clear_draft,
+)
 from .core_client import generate_lineups, get_image_bytes, resize_for_telegram
 
 logger = logging.getLogger(__name__)
 
-# Загружаем один раз при старте (при необходимости можно перечитывать)
 _players: list[PlayerRecord] = []
 
 
@@ -20,190 +39,346 @@ def get_players() -> list[PlayerRecord]:
     return _players
 
 
-def _keyboard_select_players(selected: set[int]) -> InlineKeyboardMarkup:
+# --- Старт и меню ---
+
+def _start_keyboard(update: Update) -> InlineKeyboardMarkup:
+    user = update.effective_user
+    show_admin = is_admin(user.username if user else None, user.id if user else None)
+    buttons = []
+    if show_admin:
+        buttons.append([InlineKeyboardButton("🔧 Админ-панель", callback_data="menu_admin")])
+    buttons.append([InlineKeyboardButton("⚔️ Капитанская дуэль", callback_data="menu_captain")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    clear_state(update.effective_user.id)
+    group_ok = GROUP_CHAT_ID_INT is not None
+    text = "Выбери действие:"
+    if not group_ok:
+        text += "\n\n⚠️ GROUP_CHAT_ID не задан — голосование и драфт в группе работать не будут."
+    await update.message.reply_text(text, reply_markup=_start_keyboard(update))
+
+
+async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    await query.answer()
+    data = query.data
+    if data == "menu_admin":
+        if not is_admin(update.effective_user.username, update.effective_user.id):
+            await query.edit_message_text("Нет доступа.")
+            return
+        # Админ-панель
+        voting = is_voting_active()
+        lines = ["Админ-панель.", "Начни голосование в группе и заверши его кнопкой ниже."]
+        buttons = []
+        if not voting:
+            buttons.append([InlineKeyboardButton("📢 Начать голосование", callback_data="admin_start_vote")])
+        else:
+            buttons.append([InlineKeyboardButton("✅ Завершить голосование", callback_data="admin_end_vote")])
+        buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_back")])
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    if data == "menu_captain":
+        if not has_match_players():
+            await query.edit_message_text(
+                "Сначала составьте список игроков: админ запускает голосование в беседе и нажимает «Завершить голосование».",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="menu_back")]]),
+            )
+            return
+        draft = draft_get_state()
+        if draft:
+            await query.edit_message_text("Драфт уже идёт. Участвуйте в беседе.", reply_markup=_start_keyboard(update))
+            return
+        queue = get_captain_queue()
+        match_uids = get_match_user_ids()
+        if update.effective_user.id not in match_uids:
+            await query.answer("Только проголосовавшие игроки из списка могут нажать.", show_alert=True)
+            return
+        q = add_captain_candidate(update.effective_user.id)
+        if len(q) == 1:
+            await query.edit_message_text(
+                "Вы первый капитан. Ждём второго — пусть тоже нажмёт «Капитанская дуэль».",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="menu_back")]]),
+            )
+            return
+        if len(q) == 2:
+            # Двое капитанов — показываем выбор цвета (первый нажавший выбирает)
+            try:
+                c1 = await context.bot.get_chat(q[0])
+                c2 = await context.bot.get_chat(q[1])
+                name1 = c1.username or c1.first_name or "Капитан 1"
+                name2 = c2.username or c2.first_name or "Капитан 2"
+            except Exception:
+                name1, name2 = "Капитан 1", "Капитан 2"
+            await query.edit_message_text(
+                f"Капитаны: {name1} и {name2}. Выберите цвет — кто первый нажмёт, тот и получает выбранную команду.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔴 Красные", callback_data="color_red"), InlineKeyboardButton("🔵 Синие", callback_data="color_blue")],
+                    [InlineKeyboardButton("◀️ Назад", callback_data="menu_back")],
+                ]),
+            )
+            return
+    if data == "menu_back":
+        await query.edit_message_text("Выбери действие:", reply_markup=_start_keyboard(update))
+
+
+# --- Админ: голосование ---
+
+async def callback_admin_start_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user or not is_admin(update.effective_user.username, update.effective_user.id):
+        return
+    await query.answer()
+    if GROUP_CHAT_ID_INT is None:
+        await query.edit_message_text("Укажи GROUP_CHAT_ID в .env")
+        return
+    start_voting()
+    try:
+        msg = await context.bot.send_poll(
+            GROUP_CHAT_ID_INT,
+            "Кто играет? Отметьтесь.",
+            options=["Играю"],
+            is_anonymous=False,
+        )
+        if msg.poll:
+            set_active_poll_id(str(msg.poll.id))
+    except Exception as e:
+        logger.exception("Send poll failed")
+        await query.edit_message_text(f"Не удалось отправить опрос в группу: {e}")
+        return
+    buttons = [
+        [InlineKeyboardButton("✅ Завершить голосование", callback_data="admin_end_vote")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="menu_admin")],
+    ]
+    await query.edit_message_text("Голосование запущено в беседе. По завершении нажми «Завершить голосование».", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def callback_admin_end_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user or not is_admin(update.effective_user.username, update.effective_user.id):
+        return
+    await query.answer()
+    voted = get_voted_user_ids()
+    if not voted:
+        await query.edit_message_text("Никто не проголосовал. Запусти голосование снова при необходимости.")
+        return
+    usernames = set()
+    uid_to_username = {}
     players = get_players()
+    for uid in voted:
+        try:
+            chat = await context.bot.get_chat(uid)
+            uname = (chat.username or "").strip().lower().lstrip("@")
+            if uname:
+                usernames.add(uname)
+                uid_to_username[uid] = uname
+        except Exception:
+            pass
+    indices = players_match_indices(players, usernames)
+    match_usernames = {players[i].tg.lower() for i in indices if players[i].tg}
+    match_user_ids = [uid for uid in voted if uid_to_username.get(uid, "").lower() in match_usernames]
+    if len(indices) < 2:
+        await query.edit_message_text("В таблице (колонка tg) нашлось меньше двух игроков из проголосовавших. Добавь tg-ники в таблицу.")
+        return
+    finish_voting(indices, list(set(match_user_ids)))
+    buttons = [[InlineKeyboardButton("◀️ В админку", callback_data="menu_admin")]]
+    await query.edit_message_text(f"Голосование завершено. В списке на матч: {len(indices)} человек. Можно запускать «Капитанская дуэль».", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.poll_answer:
+        return
+    poll_id = str(update.poll_answer.poll_id)
+    if get_active_poll_id() != poll_id:
+        return
+    add_vote(update.poll_answer.user.id)
+
+
+# --- Выбор цвета и старт драфта ---
+
+def _sheet_index_for_user(players: list[PlayerRecord], match_indices: list[int], username: str) -> int | None:
+    un = (username or "").lower().lstrip("@")
+    for i in match_indices:
+        if players[i].tg and players[i].tg.lower() == un:
+            return i
+    return None
+
+
+async def callback_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("color_") or not update.effective_user:
+        return
+    if draft_get_state():
+        await query.answer()
+        return
+    q = get_captain_queue()
+    if len(q) != 2 or update.effective_user.id not in q:
+        await query.answer()
+        return
+    team = "red" if query.data == "color_red" else "blue"
+    await query.answer()
+    red_uid = update.effective_user.id if team == "red" else (q[1] if q[0] == update.effective_user.id else q[0])
+    blue_uid = q[0] if red_uid == q[1] else q[1]
+    players = get_players()
+    match_indices = get_match_player_indices()
+    try:
+        c1 = await context.bot.get_chat(q[0])
+        c2 = await context.bot.get_chat(q[1])
+        cap1_sheet = _sheet_index_for_user(players, match_indices, c1.username)
+        cap2_sheet = _sheet_index_for_user(players, match_indices, c2.username)
+    except Exception:
+        cap1_sheet = match_indices[0]
+        cap2_sheet = match_indices[1]
+    if cap1_sheet is None:
+        cap1_sheet = match_indices[0]
+    if cap2_sheet is None:
+        cap2_sheet = next((i for i in match_indices if i != cap1_sheet), match_indices[1])
+    set_draft(q[0], q[1], red_uid, blue_uid, match_indices, cap1_sheet, cap2_sheet)
+    draft = draft_get_state()
+    pool = draft["pool"]
+    if not pool:
+        # Только два капитана — сразу генерируем составы и шлём в группу
+        red_team = draft["red_team"]
+        blue_team = draft["blue_team"]
+        distribution = [(i, 1) for i in red_team] + [(i, 2) for i in blue_team]
+        try:
+            csv_body = build_lineup_csv(players, distribution)
+            resp = await generate_lineups(csv_body)
+        except Exception as e:
+            logger.exception("Core request failed")
+            await query.edit_message_text(f"Ошибка генерации составов: {e}")
+            clear_draft()
+            return
+        if resp.get("status") == "ok" and GROUP_CHAT_ID_INT:
+            for t in resp.get("teams", []):
+                url = t.get("image_url")
+                if url:
+                    try:
+                        data = resize_for_telegram(await get_image_bytes(url))
+                        caption = "Красные" if t.get("team") == 1 else "Синие"
+                        await context.bot.send_photo(chat_id=GROUP_CHAT_ID_INT, photo=data, caption=caption)
+                    except Exception:
+                        pass
+        clear_draft()
+        await query.edit_message_text("В матче только два капитана — составы отправлены в беседу.")
+        return
+    # Отправляем сообщение с кнопками в группу
+    if GROUP_CHAT_ID_INT is None:
+        await query.edit_message_text("GROUP_CHAT_ID не задан — драфт в группу отправить нельзя.")
+        return
+    keyboard = _draft_keyboard(pool, draft, players)
+    msg = await context.bot.send_message(
+        GROUP_CHAT_ID_INT,
+        "🔴 Ход красных. Выберите игрока:",
+        reply_markup=keyboard,
+    )
+    draft_set_group_message_id(msg.message_id)
+    await query.edit_message_text("Драфт запущен в беседе. Участвуйте там.")
+
+
+def _draft_keyboard(pool: list[int], draft: dict, players: list[PlayerRecord]) -> InlineKeyboardMarkup:
     buttons = []
     row = []
-    for i, p in enumerate(players):
-        label = f"{'✓ ' if i in selected else ''}{p.name} {p.surname}"
-        row.append(InlineKeyboardButton(label, callback_data=f"p_{i}"))
+    for idx in pool:
+        p = players[idx]
+        row.append(InlineKeyboardButton(f"{p.name} {p.surname}", callback_data=f"pick_{idx}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("✅ Готово — перейти к распределению", callback_data="done")])
     return InlineKeyboardMarkup(buttons)
 
 
-def _keyboard_teams() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔴 Красная (1)", callback_data="t_1"),
-            InlineKeyboardButton("🔵 Синяя (2)", callback_data="t_2"),
-        ],
-    ])
+def _draft_status_text(draft: dict, players: list[PlayerRecord]) -> str:
+    turn = draft["current_turn"]
+    red_team = draft["red_team"]
+    blue_team = draft["blue_team"]
+    red_names = ", ".join(players[i].name for i in red_team)
+    blue_names = ", ".join(players[i].name for i in blue_team)
+    if turn == "red":
+        return f"🔴 Ход красных.\nКрасные: {red_names}\nСиние: {blue_names}\n\nВыберите игрока:"
+    return f"🔵 Ход синих.\nКрасные: {red_names}\nСиние: {blue_names}\n\nВыберите игрока:"
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user:
-        return
-    clear_state(update.effective_user.id)
-    players = get_players()
-    if not players:
-        await update.message.reply_text(
-            "База игроков пуста. Добавь data/players.csv в папку бота."
-        )
-        return
-    await update.message.reply_text(
-        "Выбери, кто сегодня в игре. Нажимай на игроков — галочка отметит участников. "
-        "Потом нажми «Готово».",
-        reply_markup=_keyboard_select_players(set()),
-    )
-
-
-async def callback_toggle_player(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def callback_draft_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not query or not query.data or not query.message or not update.effective_user:
+    if not query or not query.data or not query.data.startswith("pick_") or not update.effective_user:
         return
-    await query.answer()
-    if not query.data.startswith("p_"):
+    draft = draft_get_state()
+    if not draft:
+        await query.answer()
         return
     try:
-        idx = int(query.data[2:])
+        sheet_index = int(query.data[5:])
     except ValueError:
+        await query.answer()
         return
-    players = get_players()
-    if idx < 0 or idx >= len(players):
+    turn = draft["current_turn"]
+    allowed_uid = draft["red_captain_uid"] if turn == "red" else draft["blue_captain_uid"]
+    if update.effective_user.id != allowed_uid:
+        await query.answer("Не ваш ход.", show_alert=True)
         return
-    state = get_state(update.effective_user.id)
-    if state["selected"] is None:
-        state["selected"] = set()
-    if idx in state["selected"]:
-        state["selected"].remove(idx)
-    else:
-        state["selected"].add(idx)
-    await query.edit_message_text(
-        "Отметь игроков, кто в игре. Потом нажми «Готово».",
-        reply_markup=_keyboard_select_players(state["selected"]),
-    )
-
-
-async def callback_done_players(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data or query.data != "done" or not query.message or not update.effective_user:
-        return
-    state = get_state(update.effective_user.id)
-    selected = state.get("selected") or set()
-    if len(selected) < 2:
-        await query.answer("Выбери минимум 2 игроков.", show_alert=True)
+    if sheet_index not in draft.get("pool", []):
+        await query.answer("Уже выбран.")
         return
     await query.answer()
-    state["step"] = "distribute"
-    state["selected_list"] = sorted(selected)
-    state["distribution"] = []
-    state["current_index"] = 0
+    team = "red" if turn == "red" else "blue"
+    done = draft_pick(sheet_index, team)
+    draft = draft_get_state()
     players = get_players()
-    idx = state["selected_list"][0]
-    p = players[idx]
-    n = len(state["selected_list"])
-    await query.edit_message_text(
-        f"Распределение по командам (1 из {n}):\n{p.name} {p.surname} — в какую команду?",
-        reply_markup=_keyboard_teams(),
-    )
-
-
-async def callback_assign_team(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data or not query.data.startswith("t_") or not query.message or not update.effective_user:
-        return
-    await query.answer()
-    try:
-        team = int(query.data[2:])
-    except ValueError:
-        return
-    if team not in (1, 2):
-        return
-    state = get_state(update.effective_user.id)
-    if state.get("step") != "distribute":
-        return
-    sel_list = state["selected_list"]
-    cur = state["current_index"]
-    if cur >= len(sel_list):
-        return
-    player_idx = sel_list[cur]
-    state["distribution"].append((player_idx, team))
-    state["current_index"] = cur + 1
-    players = get_players()
-    n = len(sel_list)
-    if state["current_index"] == n:
-        # Все распределены — формируем CSV, дергаем core, шлём фото
-        await query.edit_message_text("Формирую составы…")
+    if done:
+        # Драфт завершён — собираем CSV и шлём картинки в группу
+        red_team = draft["red_team"]
+        blue_team = draft["blue_team"]
+        distribution = [(i, 1) for i in red_team] + [(i, 2) for i in blue_team]
+        csv_body = build_lineup_csv(players, distribution)
         try:
-            csv_body = build_lineup_csv(players, state["distribution"])
             resp = await generate_lineups(csv_body)
         except Exception as e:
             logger.exception("Core request failed")
-            await query.edit_message_text(f"Ошибка при генерации составов: {e}")
-            clear_state(update.effective_user.id)
+            await context.bot.send_message(GROUP_CHAT_ID_INT or update.effective_chat.id, f"Ошибка генерации составов: {e}")
+            clear_draft()
             return
         if resp.get("status") != "ok":
-            await query.edit_message_text(
-                resp.get("message", "Ошибка") + "\n" + resp.get("details", "")
-            )
-            clear_state(update.effective_user.id)
+            await context.bot.send_message(GROUP_CHAT_ID_INT or update.effective_chat.id, resp.get("message", "Ошибка"))
+            clear_draft()
             return
-        teams = resp.get("teams") or []
-        sent = 0
-        errors = []
-        for t in teams:
+        chat_id = GROUP_CHAT_ID_INT or update.effective_chat.id
+        for t in resp.get("teams", []):
             url = t.get("image_url")
             if not url:
                 continue
             try:
                 data = await get_image_bytes(url)
-                # Ужимаем изображение: меньше размер — быстрее загрузка в Telegram, нет таймаутов
                 data = resize_for_telegram(data)
-                await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=data,
-                    caption=f"Состав команды {t.get('team', '?')}",
-                )
-                sent += 1
+                caption = "Красные" if t.get("team") == 1 else "Синие"
+                await context.bot.send_photo(chat_id=chat_id, photo=data, caption=caption)
             except Exception as e:
                 logger.exception("Send photo failed")
-                errors.append(str(e))
-        chat_id = update.effective_chat.id
-        if sent == len(teams):
-            await context.bot.send_message(chat_id, "Готово! Составы выше.")
-        elif sent > 0:
-            await context.bot.send_message(
-                chat_id,
-                f"Отправлено {sent} из {len(teams)}. Ошибки: {errors[0][:150]}",
-            )
-        elif errors:
-            await context.bot.send_message(
-                chat_id,
-                f"Не удалось отправить фото (таймаут загрузки): {errors[0][:150]}",
-            )
         try:
-            await query.edit_message_text("Готово.")
+            await query.edit_message_text("✅ Составы сформированы и отправлены выше.")
         except Exception:
             pass
-        clear_state(update.effective_user.id)
+        clear_draft()
         return
-    # Следующий игрок
-    next_idx = state["selected_list"][state["current_index"]]
-    p = players[next_idx]
-    await query.edit_message_text(
-        f"Распределение по командам ({state['current_index'] + 1} из {n}):\n{p.name} {p.surname} — в какую команду?",
-        reply_markup=_keyboard_teams(),
-    )
+    # Обновляем сообщение с драфтом (оно в группе, query пришёл от нажатия там)
+    try:
+        keyboard = _draft_keyboard(draft["pool"], draft, players)
+        text = _draft_status_text(draft, players)
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+    except Exception as e:
+        logger.warning("Edit draft message: %s", e)
 
 
 def register_handlers(application) -> None:
-    from telegram.ext import CommandHandler, CallbackQueryHandler
+    from telegram.ext import CommandHandler, CallbackQueryHandler, PollAnswerHandler
     application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CallbackQueryHandler(callback_toggle_player, pattern="^p_\\d+$"))
-    application.add_handler(CallbackQueryHandler(callback_done_players, pattern="^done$"))
-    application.add_handler(CallbackQueryHandler(callback_assign_team, pattern="^t_[12]$"))
+    application.add_handler(CallbackQueryHandler(callback_menu, pattern="^menu_|^admin_|^color_"))
+    application.add_handler(CallbackQueryHandler(callback_draft_pick, pattern="^pick_\\d+$"))
+    application.add_handler(PollAnswerHandler(poll_answer_handler))

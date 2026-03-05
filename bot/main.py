@@ -1,6 +1,12 @@
 import os
 import logging
+from pathlib import Path
+from dotenv import load_dotenv
 from telegram.ext import Application
+
+# .env в корне проекта (при локальном запуске)
+load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from .handlers import register_handlers
 
@@ -26,7 +32,7 @@ def main() -> None:
     )
     register_handlers(app)
     logger.info("Bot starting (polling)")
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    app.run_polling(allowed_updates=["message", "callback_query", "poll_answer"])
 
 
 if __name__ == "__main__":
