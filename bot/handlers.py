@@ -1,6 +1,7 @@
 """Бот: стартовое меню (админ-панель / капитанская дуэль), голосование, драфт, отправка составов в группу."""
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from .config import GROUP_CHAT_ID_INT, is_admin
@@ -22,7 +23,7 @@ from .match_state import (
     set_draft,
     draft_get_state,
     draft_pick,
-    draft_set_group_message_id,
+    draft_add_message,
     clear_draft,
 )
 from .core_client import generate_lineups, get_image_bytes, resize_for_telegram
@@ -30,6 +31,16 @@ from .core_client import generate_lineups, get_image_bytes, resize_for_telegram
 logger = logging.getLogger(__name__)
 
 _players: list[PlayerRecord] = []
+
+# Для локального теста: считаем, что эти ники уже проголосовали «Играю»
+TEST_USERNAMES = {
+    "starluck1987",
+    "aynurkhaybullin",
+    "dariyl2",
+    "saucedealer",
+    "adelchic",
+    "pulya102",
+}
 
 
 def get_players() -> list[PlayerRecord]:
@@ -95,10 +106,8 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_text("Драфт уже идёт. Участвуйте в беседе.", reply_markup=_start_keyboard(update))
             return
         queue = get_captain_queue()
-        match_uids = get_match_user_ids()
-        if update.effective_user.id not in match_uids:
-            await query.answer("Только проголосовавшие игроки из списка могут нажать.", show_alert=True)
-            return
+        # Для MVP и тестирования не ограничиваем очередь капитанов списком проголосовавших,
+        # важно только, чтобы сам список игроков матча уже был сформирован.
         q = add_captain_candidate(update.effective_user.id)
         if len(q) == 1:
             await query.edit_message_text(
@@ -142,7 +151,7 @@ async def callback_admin_start_vote(update: Update, context: ContextTypes.DEFAUL
         msg = await context.bot.send_poll(
             GROUP_CHAT_ID_INT,
             "Кто играет? Отметьтесь.",
-            options=["Играю"],
+            options=["Играю", "Не играю"],
             is_anonymous=False,
         )
         if msg.poll:
@@ -179,9 +188,20 @@ async def callback_admin_end_vote(update: Update, context: ContextTypes.DEFAULT_
                 uid_to_username[uid] = uname
         except Exception:
             pass
+    # Для теста добавляем фиктивных «проголосовавших» по никам из TEST_USERNAMES
+    usernames |= TEST_USERNAMES
+
+    if not players:
+        await query.edit_message_text("Не удалось загрузить игроков из Google Sheets. Проверь ссылку и доступ к таблице.")
+        return
+
     indices = players_match_indices(players, usernames)
     match_usernames = {players[i].tg.lower() for i in indices if players[i].tg}
     match_user_ids = [uid for uid in voted if uid_to_username.get(uid, "").lower() in match_usernames]
+    # Если никого из реальных голосовавших не нашли в таблице, для теста
+    # добавляем текущего администратора, чтобы он мог запускать дуэль.
+    if not match_user_ids and update.effective_user:
+        match_user_ids = [update.effective_user.id]
     if len(indices) < 2:
         await query.edit_message_text("В таблице (колонка tg) нашлось меньше двух игроков из проголосовавших. Добавь tg-ники в таблицу.")
         return
@@ -196,7 +216,11 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     poll_id = str(update.poll_answer.poll_id)
     if get_active_poll_id() != poll_id:
         return
-    add_vote(update.poll_answer.user.id)
+    # Вариант 0 — «Играю», вариант 1 — «Не играю».
+    # Считаем, что игрок в списке, только если выбрал «Играю».
+    option_ids = update.poll_answer.option_ids or []
+    if 0 in option_ids:
+        add_vote(update.poll_answer.user.id)
 
 
 # --- Выбор цвета и старт драфта ---
@@ -267,18 +291,21 @@ async def callback_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         clear_draft()
         await query.edit_message_text("В матче только два капитана — составы отправлены в беседу.")
         return
-    # Отправляем сообщение с кнопками в группу
-    if GROUP_CHAT_ID_INT is None:
-        await query.edit_message_text("GROUP_CHAT_ID не задан — драфт в группу отправить нельзя.")
-        return
+    # Отправляем сообщение с кнопками в личку обоим капитанам
     keyboard = _draft_keyboard(pool, draft, players)
-    msg = await context.bot.send_message(
-        GROUP_CHAT_ID_INT,
-        "🔴 Ход красных. Выберите игрока:",
-        reply_markup=keyboard,
-    )
-    draft_set_group_message_id(msg.message_id)
-    await query.edit_message_text("Драфт запущен в беседе. Участвуйте там.")
+    text = _draft_status_text(draft, players)
+    try:
+        msg1 = await context.bot.send_message(red_uid, text, reply_markup=keyboard)
+        draft_add_message(red_uid, msg1.message_id)
+    except Exception as e:
+        logger.warning("Send draft to red captain failed: %s", e)
+    try:
+        if blue_uid != red_uid:
+            msg2 = await context.bot.send_message(blue_uid, text, reply_markup=keyboard)
+            draft_add_message(blue_uid, msg2.message_id)
+    except Exception as e:
+        logger.warning("Send draft to blue captain failed: %s", e)
+    await query.edit_message_text("Драфт запущен в личке капитанов.")
 
 
 def _draft_keyboard(pool: list[int], draft: dict, players: list[PlayerRecord]) -> InlineKeyboardMarkup:
@@ -306,28 +333,41 @@ def _draft_status_text(draft: dict, players: list[PlayerRecord]) -> str:
     return f"🔵 Ход синих.\nКрасные: {red_names}\nСиние: {blue_names}\n\nВыберите игрока:"
 
 
+async def _safe_answer_callback(query, text: str | None = None, show_alert: bool = False) -> None:
+    """Ответ на callback; игнорируем «Query is too old» (таймаут Telegram ~30 с)."""
+    try:
+        if text is not None:
+            await query.answer(text=text, show_alert=show_alert)
+        else:
+            await query.answer()
+    except BadRequest as e:
+        if "too old" not in str(e).lower() and "invalid" not in str(e).lower():
+            raise
+        logger.debug("Callback query expired: %s", e)
+
+
 async def callback_draft_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data or not query.data.startswith("pick_") or not update.effective_user:
         return
     draft = draft_get_state()
     if not draft:
-        await query.answer()
+        await _safe_answer_callback(query)
         return
     try:
         sheet_index = int(query.data[5:])
     except ValueError:
-        await query.answer()
+        await _safe_answer_callback(query)
         return
     turn = draft["current_turn"]
     allowed_uid = draft["red_captain_uid"] if turn == "red" else draft["blue_captain_uid"]
     if update.effective_user.id != allowed_uid:
-        await query.answer("Не ваш ход.", show_alert=True)
+        await _safe_answer_callback(query, "Не ваш ход.", show_alert=True)
         return
     if sheet_index not in draft.get("pool", []):
-        await query.answer("Уже выбран.")
+        await _safe_answer_callback(query, "Уже выбран.")
         return
-    await query.answer()
+    await _safe_answer_callback(query)
     team = "red" if turn == "red" else "blue"
     done = draft_pick(sheet_index, team)
     draft = draft_get_state()
@@ -367,18 +407,39 @@ async def callback_draft_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
             pass
         clear_draft()
         return
-    # Обновляем сообщение с драфтом (оно в группе, query пришёл от нажатия там)
+    # Обновляем сообщения драфта в личках обоих капитанов
     try:
         keyboard = _draft_keyboard(draft["pool"], draft, players)
         text = _draft_status_text(draft, players)
+        # Сообщение, по которому пришёл callback
         await query.edit_message_text(text=text, reply_markup=keyboard)
+        # Вторая личка капитана, если есть сохранённый message_id
+        msgs = draft.get("messages") or {}
+        other_uid = draft["red_captain_uid"] if update.effective_user.id != draft["red_captain_uid"] else draft["blue_captain_uid"]
+        mid = msgs.get(str(other_uid))
+        if mid:
+            await context.bot.edit_message_text(chat_id=other_uid, message_id=mid, text=text, reply_markup=keyboard)
     except Exception as e:
         logger.warning("Edit draft message: %s", e)
 
 
 def register_handlers(application) -> None:
     from telegram.ext import CommandHandler, CallbackQueryHandler, PollAnswerHandler
+
     application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CallbackQueryHandler(callback_menu, pattern="^menu_|^admin_|^color_"))
+
+    # Меню (старт, админ-панель, капитанская дуэль)
+    application.add_handler(CallbackQueryHandler(callback_menu, pattern="^menu_"))
+
+    # Выбор цвета капитанами
+    application.add_handler(CallbackQueryHandler(callback_color, pattern="^color_"))
+
+    # Админские действия
+    application.add_handler(CallbackQueryHandler(callback_admin_start_vote, pattern="^admin_start_vote$"))
+    application.add_handler(CallbackQueryHandler(callback_admin_end_vote, pattern="^admin_end_vote$"))
+
+    # Драфт
     application.add_handler(CallbackQueryHandler(callback_draft_pick, pattern="^pick_\\d+$"))
+
+    # Ответы на опрос
     application.add_handler(PollAnswerHandler(poll_answer_handler))

@@ -6,11 +6,13 @@ from typing import List
 
 import httpx
 
-# Берём URL CSV-экспорта Google Sheets из env, по умолчанию — твоя таблица (gid=0)
-PLAYERS_SHEET_CSV_URL = os.environ.get(
-    "PLAYERS_SHEET_CSV_URL",
-    "https://docs.google.com/spreadsheets/d/1osDxnnQ-7MUvS3cUpZBdW7ess6fLcQtiRZqzhMlvgRc/export?format=csv&gid=0",
+# URL CSV-экспорта Google Sheets по умолчанию (если в env пусто)
+DEFAULT_PLAYERS_SHEET_CSV_URL = (
+    "https://docs.google.com/spreadsheets/d/1osDxnnQ-7MUvS3cUpZBdW7ess6fLcQtiRZqzhMlvgRc/export?format=csv&gid=0"
 )
+
+# Если PLAYERS_SHEET_CSV_URL задана, но пустая строка, используем default
+PLAYERS_SHEET_CSV_URL = os.environ.get("PLAYERS_SHEET_CSV_URL") or DEFAULT_PLAYERS_SHEET_CSV_URL
 
 
 @dataclass

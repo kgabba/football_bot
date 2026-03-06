@@ -116,7 +116,7 @@ def set_draft(
         "blue_team": [blue_sheet],
         "pool": pool,
         "current_turn": "red",
-        "group_message_id": None,
+        "messages": {},
     }
     _save(d)
 
@@ -138,11 +138,15 @@ def draft_get_state() -> dict[str, Any] | None:
     return _load().get("draft")
 
 
-def draft_set_group_message_id(message_id: int) -> None:
+def draft_add_message(user_id: int, message_id: int) -> None:
     d = _load()
-    if d.get("draft"):
-        d["draft"]["group_message_id"] = message_id
-        _save(d)
+    draft = d.get("draft")
+    if not draft:
+        return
+    msgs = draft.get("messages") or {}
+    msgs[str(user_id)] = message_id
+    draft["messages"] = msgs
+    _save(d)
 
 
 def clear_draft() -> None:
