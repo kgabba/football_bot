@@ -154,7 +154,8 @@ uvicorn app.main:app --reload
 
 - **BOT_TOKEN** — токен от @BotFather
 - **GROUP_CHAT_ID** — ID беседы (для опроса и драфта). Для теста можно указать ID своей лички (узнать через @userinfobot).
-- **ADMIN_USERNAMES** — никнеймы Telegram без @, через запятую (например `user1,user2`).
+- **ADMIN_USERNAMES** — админы через запятую: `username` (или `@username`) и/или числовые Telegram `user_id`.
+  - пример: `user1,user2,5493496803`
 - **CORE_URL** — при Docker оставь `http://core:8000`; при локальном запуске — `http://localhost:8000`.
 - **PLAYERS_SHEET_CSV_URL** — опционально; по умолчанию используется таблица из кода.
 

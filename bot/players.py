@@ -91,13 +91,31 @@ def load_players(csv_url: str | None = None) -> List[PlayerRecord]:
     return players
 
 
-def get_match_player_indices(players: List[PlayerRecord], voted_usernames: set[str]) -> List[int]:
+def get_match_player_indices(
+    players: List[PlayerRecord],
+    voted_usernames: set[str],
+    voted_user_ids: set[int] | None = None,
+) -> List[int]:
     """
-    Индексы игроков из таблицы, чей tg совпадает с кем-то из voted_usernames.
-    voted_usernames — ники без @, в любом регистре.
+    Индексы игроков из таблицы, чей tg совпадает с проголосовавшими.
+    - Если tg состоит из цифр — считаем это user_id и матчим по voted_user_ids.
+    - Иначе tg — ник; матчим по voted_usernames (сравнение без учёта регистра, как в Telegram).
     """
+    voted_ids = voted_user_ids or set()
     normalized = {u.lstrip("@").lower() if u else "" for u in voted_usernames if u}
-    return [i for i, p in enumerate(players) if p.tg and p.tg.lower() in normalized]
+    result = []
+    for i, p in enumerate(players):
+        if not p.tg:
+            continue
+        if p.tg.isdigit():
+            try:
+                if int(p.tg) in voted_ids:
+                    result.append(i)
+            except (ValueError, OverflowError):
+                pass
+        elif p.tg.lower() in normalized:
+            result.append(i)
+    return result
 
 
 def build_lineup_csv(players: List[PlayerRecord], distribution: List[tuple[int, int]]) -> str:

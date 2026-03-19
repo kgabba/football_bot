@@ -4,7 +4,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
-from .config import GROUP_CHAT_ID_INT, is_admin
+from .config import GROUP_CHAT_ID_INT, GROUP_TOPIC_ID, is_admin
 from .players import load_players, build_lineup_csv, get_match_player_indices as players_match_indices, PlayerRecord
 from .state import get_state, clear_state
 from .match_state import (
@@ -25,6 +25,7 @@ from .match_state import (
     draft_pick,
     draft_add_message,
     clear_draft,
+    reset_match,
 )
 from .core_client import generate_lineups, get_image_bytes, resize_for_telegram
 
@@ -32,22 +33,24 @@ logger = logging.getLogger(__name__)
 
 _players: list[PlayerRecord] = []
 
-# Для локального теста: считаем, что эти ники уже проголосовали «Играю»
-TEST_USERNAMES = {
-    "starluck1987",
-    "aynurkhaybullin",
-    "dariyl2",
-    "saucedealer",
-    "adelchic",
-    "pulya102",
-}
-
-
 def get_players() -> list[PlayerRecord]:
     global _players
     if not _players:
         _players = load_players()
     return _players
+
+
+def _group_send_kw(chat_id: int | None = None) -> dict:
+    """Кварг для отправки в группу: message_thread_id, если задана тема и это именно группа."""
+    if GROUP_TOPIC_ID is not None and (chat_id is None or chat_id == GROUP_CHAT_ID_INT):
+        return {"message_thread_id": GROUP_TOPIC_ID}
+    return {}
+
+
+async def _send_to_group(context, chat_id: int, text: str) -> None:
+    """Отправить сообщение в группу (при необходимости — в тему)."""
+    kw = {"chat_id": chat_id, "text": text, **_group_send_kw(chat_id)}
+    await context.bot.send_message(**kw)
 
 
 # --- Старт и меню ---
@@ -146,25 +149,82 @@ async def callback_admin_start_vote(update: Update, context: ContextTypes.DEFAUL
     if GROUP_CHAT_ID_INT is None:
         await query.edit_message_text("Укажи GROUP_CHAT_ID в .env")
         return
+    # Сначала попросим админа ввести шапку для голосовалки.
+    st = get_state(update.effective_user.id)
+    st["step"] = "admin_vote_header"
+    buttons = [[InlineKeyboardButton("◀️ Назад", callback_data="admin_cancel_vote_header")]]
+    await query.edit_message_text(
+        "Введите текст шапки для голосовалки (одним сообщением).\n\nНапример: «Кто играет?»",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def callback_admin_cancel_vote_header(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user or not is_admin(update.effective_user.username, update.effective_user.id):
+        return
+    await query.answer()
+    st = get_state(update.effective_user.id)
+    st["step"] = None
+    await query.edit_message_text("Выбери действие:", reply_markup=_start_keyboard(update))
+
+
+async def admin_vote_header_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user or not update.message.text:
+        return
+    if not is_admin(update.effective_user.username, update.effective_user.id):
+        return
+    st = get_state(update.effective_user.id)
+    if st.get("step") != "admin_vote_header":
+        return
+
+    header = update.message.text.strip()
+    if not header:
+        await update.message.reply_text("Шапка не может быть пустой. Введите текст ещё раз.")
+        return
+
+    if GROUP_CHAT_ID_INT is None:
+        await update.message.reply_text("Укажи `GROUP_CHAT_ID` в .env и попробуй снова.")
+        return
+
+    # Запускаем голосование только после того, как админ ввёл текст.
     start_voting()
     try:
+        poll_kw = {}
+        if GROUP_TOPIC_ID is not None:
+            poll_kw["message_thread_id"] = GROUP_TOPIC_ID
+
+        question = f"{header}\n\nОтметьтесь."
         msg = await context.bot.send_poll(
             GROUP_CHAT_ID_INT,
-            "Кто играет? Отметьтесь.",
+            question,
             options=["Играю", "Не играю"],
             is_anonymous=False,
+            **poll_kw,
         )
         if msg.poll:
             set_active_poll_id(str(msg.poll.id))
+        else:
+            raise RuntimeError("Telegram poll has no poll id")
+
     except Exception as e:
         logger.exception("Send poll failed")
-        await query.edit_message_text(f"Не удалось отправить опрос в группу: {e}")
+        reset_match()
+        # Оставим состояние ожидания шапки, чтобы админ мог повторить ввод.
+        st["step"] = "admin_vote_header"
+        await update.message.reply_text(f"Не удалось отправить опрос в группу: {e}\nВведите текст шапки ещё раз.")
         return
+
+    # Успех: очищаем ожидание шапки и даём кнопки завершения.
+    st["step"] = None
     buttons = [
         [InlineKeyboardButton("✅ Завершить голосование", callback_data="admin_end_vote")],
         [InlineKeyboardButton("◀️ Назад", callback_data="menu_admin")],
     ]
-    await query.edit_message_text("Голосование запущено в беседе. По завершении нажми «Завершить голосование».", reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text(
+        "Голосование запущено в беседе. По завершении нажми «Завершить голосование».",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def callback_admin_end_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -172,10 +232,15 @@ async def callback_admin_end_vote(update: Update, context: ContextTypes.DEFAULT_
     if not query or not update.effective_user or not is_admin(update.effective_user.username, update.effective_user.id):
         return
     await query.answer()
-    voted = get_voted_user_ids()
-    if not voted:
+    MAX_VOTED = 22
+    voted_full = get_voted_user_ids()
+    if not voted_full:
         await query.edit_message_text("Никто не проголосовал. Запусти голосование снова при необходимости.")
         return
+
+    # Ограничиваем первые MAX_VOTED голосов: те, кто проголосовал позже, в состав и драфт не попадут.
+    voted = voted_full[:MAX_VOTED]
+    dropped = len(voted_full) - len(voted)
     usernames = set()
     uid_to_username = {}
     players = get_players()
@@ -188,26 +253,36 @@ async def callback_admin_end_vote(update: Update, context: ContextTypes.DEFAULT_
                 uid_to_username[uid] = uname
         except Exception:
             pass
-    # Для теста добавляем фиктивных «проголосовавших» по никам из TEST_USERNAMES
-    usernames |= TEST_USERNAMES
+    # Список формируется только из тех, кто проголосовал в опросе в чате
 
     if not players:
         await query.edit_message_text("Не удалось загрузить игроков из Google Sheets. Проверь ссылку и доступ к таблице.")
         return
 
-    indices = players_match_indices(players, usernames)
-    match_usernames = {players[i].tg.lower() for i in indices if players[i].tg}
-    match_user_ids = [uid for uid in voted if uid_to_username.get(uid, "").lower() in match_usernames]
-    # Если никого из реальных голосовавших не нашли в таблице, для теста
-    # добавляем текущего администратора, чтобы он мог запускать дуэль.
-    if not match_user_ids and update.effective_user:
-        match_user_ids = [update.effective_user.id]
+    voted_set = set(voted)
+    indices = players_match_indices(players, usernames, voted_set)
+    match_usernames = {players[i].tg.lower() for i in indices if players[i].tg and not players[i].tg.isdigit()}
+    match_ids_from_tg = set()
+    for i in indices:
+        if players[i].tg and players[i].tg.isdigit():
+            try:
+                match_ids_from_tg.add(int(players[i].tg))
+            except (ValueError, OverflowError):
+                pass
+    match_user_ids = [
+        uid for uid in voted
+        if uid_to_username.get(uid, "").lower() in match_usernames or uid in match_ids_from_tg
+    ]
     if len(indices) < 2:
         await query.edit_message_text("В таблице (колонка tg) нашлось меньше двух игроков из проголосовавших. Добавь tg-ники в таблицу.")
         return
     finish_voting(indices, list(set(match_user_ids)))
     buttons = [[InlineKeyboardButton("◀️ В админку", callback_data="menu_admin")]]
-    await query.edit_message_text(f"Голосование завершено. В списке на матч: {len(indices)} человек. Можно запускать «Капитанская дуэль».", reply_markup=InlineKeyboardMarkup(buttons))
+    suffix = f"\n(Лимит: первые {MAX_VOTED} голосов, ещё {dropped} проголосовавших отброшены.)" if dropped > 0 else ""
+    await query.edit_message_text(
+        f"Голосование завершено. В списке на матч: {len(indices)} человек. Можно запускать «Капитанская дуэль».{suffix}",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -225,10 +300,24 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- Выбор цвета и старт драфта ---
 
-def _sheet_index_for_user(players: list[PlayerRecord], match_indices: list[int], username: str) -> int | None:
-    un = (username or "").lower().lstrip("@")
+def _sheet_index_for_user(
+    players: list[PlayerRecord],
+    match_indices: list[int],
+    username: str | None,
+    user_id: int | None = None,
+) -> int | None:
+    """Найти индекс игрока в таблице по нику или по user_id (если в tg записан ID)."""
+    un = (username or "").lower().lstrip("@") if username else ""
     for i in match_indices:
-        if players[i].tg and players[i].tg.lower() == un:
+        if not players[i].tg:
+            continue
+        if players[i].tg.isdigit() and user_id is not None:
+            try:
+                if int(players[i].tg) == user_id:
+                    return i
+            except (ValueError, OverflowError):
+                pass
+        elif un and players[i].tg.lower() == un:
             return i
     return None
 
@@ -253,8 +342,8 @@ async def callback_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         c1 = await context.bot.get_chat(q[0])
         c2 = await context.bot.get_chat(q[1])
-        cap1_sheet = _sheet_index_for_user(players, match_indices, c1.username)
-        cap2_sheet = _sheet_index_for_user(players, match_indices, c2.username)
+        cap1_sheet = _sheet_index_for_user(players, match_indices, c1.username, q[0])
+        cap2_sheet = _sheet_index_for_user(players, match_indices, c2.username, q[1])
     except Exception:
         cap1_sheet = match_indices[0]
         cap2_sheet = match_indices[1]
@@ -279,13 +368,14 @@ async def callback_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             clear_draft()
             return
         if resp.get("status") == "ok" and GROUP_CHAT_ID_INT:
+            photo_kw = {"chat_id": GROUP_CHAT_ID_INT, **_group_send_kw(GROUP_CHAT_ID_INT)}
             for t in resp.get("teams", []):
                 url = t.get("image_url")
                 if url:
                     try:
                         data = resize_for_telegram(await get_image_bytes(url))
                         caption = "Красные" if t.get("team") == 1 else "Синие"
-                        await context.bot.send_photo(chat_id=GROUP_CHAT_ID_INT, photo=data, caption=caption)
+                        await context.bot.send_photo(photo=data, caption=caption, **photo_kw)
                     except Exception:
                         pass
         clear_draft()
@@ -382,14 +472,15 @@ async def callback_draft_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
             resp = await generate_lineups(csv_body)
         except Exception as e:
             logger.exception("Core request failed")
-            await context.bot.send_message(GROUP_CHAT_ID_INT or update.effective_chat.id, f"Ошибка генерации составов: {e}")
+            _send_to_group(context, GROUP_CHAT_ID_INT or update.effective_chat.id, f"Ошибка генерации составов: {e}")
             clear_draft()
             return
         if resp.get("status") != "ok":
-            await context.bot.send_message(GROUP_CHAT_ID_INT or update.effective_chat.id, resp.get("message", "Ошибка"))
+            _send_to_group(context, GROUP_CHAT_ID_INT or update.effective_chat.id, resp.get("message", "Ошибка"))
             clear_draft()
             return
         chat_id = GROUP_CHAT_ID_INT or update.effective_chat.id
+        photo_kw = {"chat_id": chat_id, **_group_send_kw(chat_id)}
         for t in resp.get("teams", []):
             url = t.get("image_url")
             if not url:
@@ -398,7 +489,7 @@ async def callback_draft_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
                 data = await get_image_bytes(url)
                 data = resize_for_telegram(data)
                 caption = "Красные" if t.get("team") == 1 else "Синие"
-                await context.bot.send_photo(chat_id=chat_id, photo=data, caption=caption)
+                await context.bot.send_photo(photo=data, caption=caption, **photo_kw)
             except Exception as e:
                 logger.exception("Send photo failed")
         try:
@@ -424,7 +515,7 @@ async def callback_draft_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def register_handlers(application) -> None:
-    from telegram.ext import CommandHandler, CallbackQueryHandler, PollAnswerHandler
+    from telegram.ext import CommandHandler, CallbackQueryHandler, PollAnswerHandler, MessageHandler, filters
 
     application.add_handler(CommandHandler("start", cmd_start))
 
@@ -437,9 +528,15 @@ def register_handlers(application) -> None:
     # Админские действия
     application.add_handler(CallbackQueryHandler(callback_admin_start_vote, pattern="^admin_start_vote$"))
     application.add_handler(CallbackQueryHandler(callback_admin_end_vote, pattern="^admin_end_vote$"))
+    application.add_handler(CallbackQueryHandler(callback_admin_cancel_vote_header, pattern="^admin_cancel_vote_header$"))
 
     # Драфт
     application.add_handler(CallbackQueryHandler(callback_draft_pick, pattern="^pick_\\d+$"))
 
     # Ответы на опрос
     application.add_handler(PollAnswerHandler(poll_answer_handler))
+
+    # Ввод текста админом для шапки голосовалки
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vote_header_message_handler)
+    )

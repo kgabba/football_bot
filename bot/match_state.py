@@ -30,8 +30,9 @@ def is_voting_active() -> bool:
     return _load().get("voting_active", False)
 
 
-def get_voted_user_ids() -> set[int]:
-    return set(_load().get("voted_user_ids", []))
+def get_voted_user_ids() -> list[int]:
+    # Важно: возвращаем список, чтобы сохранялся порядок первых голосовавших.
+    return list(_load().get("voted_user_ids", []))
 
 
 def get_match_player_indices() -> list[int]:
